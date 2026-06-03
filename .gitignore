@@ -22,6 +22,9 @@ htmlcov/
 # Test Reports
 rspec.xml
 
+# Generated example artifacts
+/artifacts/
+
 # Type Checking
 .mypy_cache/
 
