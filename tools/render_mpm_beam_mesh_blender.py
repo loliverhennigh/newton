@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument(
+        "--camera-reference",
+        choices=("teacher", "teacher-prediction"),
+        default="teacher",
+        help="Use teacher-only framing for fair method comparisons, or include the prediction in camera bounds.",
+    )
     return parser.parse_args(argv)
 
 
@@ -234,14 +240,23 @@ def main() -> None:
     teacher = make_mesh_object("NewtonTeacher", teacher_q[0] + np.array([0.0, 0.0, z_shift]), faces, teacher_mat)
     pred = make_mesh_object("POD_NN", pred_q[0] + np.array([0.0, 0.0, -z_shift]), faces, pred_mat)
 
-    all_points = np.concatenate(
-        [
-            teacher_q.reshape(-1, 3) + np.array([0.0, 0.0, z_shift]),
-            pred_q.reshape(-1, 3) + np.array([0.0, 0.0, -z_shift]),
-        ],
-        axis=0,
-    )
-    setup_camera_and_lights(all_points, args.width, args.height, args.fps)
+    if args.camera_reference == "teacher":
+        camera_points = np.concatenate(
+            [
+                teacher_q.reshape(-1, 3) + np.array([0.0, 0.0, z_shift]),
+                teacher_q.reshape(-1, 3) + np.array([0.0, 0.0, -z_shift]),
+            ],
+            axis=0,
+        )
+    else:
+        camera_points = np.concatenate(
+            [
+                teacher_q.reshape(-1, 3) + np.array([0.0, 0.0, z_shift]),
+                pred_q.reshape(-1, 3) + np.array([0.0, 0.0, -z_shift]),
+            ],
+            axis=0,
+        )
+    setup_camera_and_lights(camera_points, args.width, args.height, args.fps)
     frame_dir = args.output_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
     scene = bpy.context.scene
@@ -285,6 +300,7 @@ def main() -> None:
         "usd": str(args.output_dir / f"{args.label}_teacher_vs_pod_nn_mesh.usda"),
         "mp4": str(mp4),
         "gif": str(gif),
+        "camera_reference": args.camera_reference,
         "quality": report["quality"],
         "timing": report["timing"],
     }

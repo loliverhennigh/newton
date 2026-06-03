@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from newton.examples.mpm.rom.beam_twist_pod_nn import (
+    fit_collider_condition_pod,
     fit_pod,
     generate_controlled_rollout,
     generate_rollout,
@@ -70,6 +71,15 @@ def parser() -> argparse.ArgumentParser:
     pod.add_argument("--rank", type=int, default=16)
     pod.add_argument("rollouts", type=Path, nargs="+")
 
+    condition_pod = sub.add_parser(
+        "fit-condition-pod",
+        help="Fit POD coefficients for per-particle collider signed-distance/normal/velocity fields.",
+    )
+    condition_pod.add_argument("--output-dir", type=Path, required=True)
+    condition_pod.add_argument("--run-name", type=str, default="collider_condition_pod_rank8")
+    condition_pod.add_argument("--rank", type=int, default=8)
+    condition_pod.add_argument("rollouts", type=Path, nargs="+")
+
     train = sub.add_parser("train-nn", help="Train latent MLP dynamics.")
     train.add_argument("--output-dir", type=Path, required=True)
     train.add_argument("--run-name", type=str, default="pod_nn_latent")
@@ -79,6 +89,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--batch-size", type=int, default=256)
     train.add_argument("--lr", type=float, default=1.0e-3)
     train.add_argument("--seed", type=int, default=1234)
+    train.add_argument("--condition-pod-dir", type=Path)
     train.add_argument("rollouts", type=Path, nargs="+")
 
     linear = sub.add_parser("train-linear", help="Train a linear latent dynamics baseline.")
@@ -86,6 +97,7 @@ def parser() -> argparse.ArgumentParser:
     linear.add_argument("--run-name", type=str, default="pod_linear_latent")
     linear.add_argument("--pod-dir", type=Path, required=True)
     linear.add_argument("--ridge", type=float, default=1.0e-6)
+    linear.add_argument("--condition-pod-dir", type=Path)
     linear.add_argument("rollouts", type=Path, nargs="+")
 
     rollout = sub.add_parser("rollout", help="Run autoregressive held-out POD+NN rollout.")
@@ -93,6 +105,7 @@ def parser() -> argparse.ArgumentParser:
     rollout.add_argument("--run-name", type=str, default="heldout_pod_nn_rollout")
     rollout.add_argument("--pod-dir", type=Path, required=True)
     rollout.add_argument("--model-dir", type=Path, required=True)
+    rollout.add_argument("--condition-pod-dir", type=Path)
     rollout.add_argument("rollout", type=Path)
 
     rollout_linear = sub.add_parser("rollout-linear", help="Run autoregressive held-out POD+linear rollout.")
@@ -100,6 +113,7 @@ def parser() -> argparse.ArgumentParser:
     rollout_linear.add_argument("--run-name", type=str, default="heldout_pod_linear_rollout")
     rollout_linear.add_argument("--pod-dir", type=Path, required=True)
     rollout_linear.add_argument("--model-dir", type=Path, required=True)
+    rollout_linear.add_argument("--condition-pod-dir", type=Path)
     rollout_linear.add_argument("rollout", type=Path)
 
     render = sub.add_parser("render", help="Render comparison GIF/MP4 using ffmpeg.")
@@ -139,6 +153,17 @@ def parser() -> argparse.ArgumentParser:
     dataset.add_argument("--epochs", type=int, default=1500)
     dataset.add_argument("--voxel-size", type=float, default=0.75)
     dataset.add_argument("--hidden-dim", type=int, default=96)
+    dataset.add_argument(
+        "--conditioning-mode",
+        choices=["scripted-control", "collider-pod", "all"],
+        default="all",
+        help=(
+            "scripted-control trains the original POD+linear and POD+NN methods; "
+            "collider-pod trains POD+linear plus collider-conditioned POD+NN; "
+            "all trains all three methods."
+        ),
+    )
+    dataset.add_argument("--condition-rank", type=int, default=8)
 
     return p
 
@@ -188,6 +213,8 @@ def main() -> None:
         )
     elif args.cmd == "fit-pod":
         print(fit_pod(args.output_dir, args.rollouts, rank=args.rank, run_name=args.run_name))
+    elif args.cmd == "fit-condition-pod":
+        print(fit_collider_condition_pod(args.output_dir, args.rollouts, rank=args.rank, run_name=args.run_name))
     elif args.cmd == "train-nn":
         print(
             train_mlp(
@@ -200,6 +227,7 @@ def main() -> None:
                 batch_size=args.batch_size,
                 lr=args.lr,
                 seed=args.seed,
+                condition_pod_dir=args.condition_pod_dir,
             )
         )
     elif args.cmd == "train-linear":
@@ -210,10 +238,20 @@ def main() -> None:
                 args.pod_dir,
                 run_name=args.run_name,
                 ridge=args.ridge,
+                condition_pod_dir=args.condition_pod_dir,
             )
         )
     elif args.cmd == "rollout":
-        print(rollout_latent_nn(args.output_dir, args.rollout, args.pod_dir, args.model_dir, run_name=args.run_name))
+        print(
+            rollout_latent_nn(
+                args.output_dir,
+                args.rollout,
+                args.pod_dir,
+                args.model_dir,
+                run_name=args.run_name,
+                condition_pod_dir=args.condition_pod_dir,
+            )
+        )
     elif args.cmd == "rollout-linear":
         print(
             rollout_latent_linear(
@@ -222,6 +260,7 @@ def main() -> None:
                 args.pod_dir,
                 args.model_dir,
                 run_name=args.run_name,
+                condition_pod_dir=args.condition_pod_dir,
             )
         )
     elif args.cmd == "render":
@@ -616,14 +655,44 @@ def run_controlled_dataset(args: argparse.Namespace) -> None:
         spec_rows.append({**spec, "path": str(rollout)})
 
     pod = fit_pod(root / "pod_models", generated["train"], rank=args.rank, run_name=f"pod_rank{args.rank}")
-    linear_model = train_linear_latent(root / "latent_models", generated["train"], pod)
-    nn_model = train_mlp(
+    use_scripted_nn = args.conditioning_mode in ("scripted-control", "all")
+    use_collider_nn = args.conditioning_mode in ("collider-pod", "all")
+    condition_pod = None
+    if use_collider_nn:
+        condition_pod = fit_collider_condition_pod(
+            root / "condition_models",
+            generated["train"],
+            rank=args.condition_rank,
+            run_name=f"collider_condition_pod_rank{args.condition_rank}",
+        )
+    linear_model = train_linear_latent(
         root / "latent_models",
         generated["train"],
         pod,
-        hidden_dim=args.hidden_dim,
-        epochs=args.epochs,
+        condition_pod_dir=None,
     )
+    scripted_nn_model = None
+    if use_scripted_nn:
+        scripted_nn_model = train_mlp(
+            root / "latent_models",
+            generated["train"],
+            pod,
+            run_name="pod_nn_latent_scripted",
+            hidden_dim=args.hidden_dim,
+            epochs=args.epochs,
+            condition_pod_dir=None,
+        )
+    collider_nn_model = None
+    if use_collider_nn:
+        collider_nn_model = train_mlp(
+            root / "latent_models",
+            generated["train"],
+            pod,
+            run_name="pod_nn_latent_collider",
+            hidden_dim=args.hidden_dim,
+            epochs=args.epochs,
+            condition_pod_dir=condition_pod,
+        )
 
     eval_rows = []
     for split in ("val", "extra"):
@@ -634,24 +703,39 @@ def run_controlled_dataset(args: argparse.Namespace) -> None:
                 pod,
                 linear_model,
                 run_name=f"{rollout.name}_pod_linear",
+                condition_pod_dir=None,
             )
-            nn_pred = rollout_latent_nn(
-                root / "reduced_rollouts" / split,
-                rollout,
-                pod,
-                nn_model,
-                run_name=f"{rollout.name}_pod_nn",
-            )
-            eval_rows.append(
-                {
-                    "split": split,
-                    "rollout": str(rollout),
-                    "linear_rollout": str(linear_pred),
-                    "nn_rollout": str(nn_pred),
-                    "linear_report": read_json(linear_pred / "rollout_report.json"),
-                    "nn_report": read_json(nn_pred / "rollout_report.json"),
-                }
-            )
+            row = {
+                "split": split,
+                "rollout": str(rollout),
+                "linear_rollout": str(linear_pred),
+                "linear_report": read_json(linear_pred / "rollout_report.json"),
+            }
+            if scripted_nn_model is not None:
+                scripted_nn_pred = rollout_latent_nn(
+                    root / "reduced_rollouts" / split,
+                    rollout,
+                    pod,
+                    scripted_nn_model,
+                    run_name=f"{rollout.name}_pod_nn",
+                    condition_pod_dir=None,
+                )
+                row["nn_rollout"] = str(scripted_nn_pred)
+                row["scripted_nn_rollout"] = str(scripted_nn_pred)
+                row["nn_report"] = read_json(scripted_nn_pred / "rollout_report.json")
+                row["scripted_nn_report"] = row["nn_report"]
+            if collider_nn_model is not None:
+                collider_nn_pred = rollout_latent_nn(
+                    root / "reduced_rollouts" / split,
+                    rollout,
+                    pod,
+                    collider_nn_model,
+                    run_name=f"{rollout.name}_pod_nn_collider",
+                    condition_pod_dir=condition_pod,
+                )
+                row["collider_nn_rollout"] = str(collider_nn_pred)
+                row["collider_nn_report"] = read_json(collider_nn_pred / "rollout_report.json")
+            eval_rows.append(row)
 
     summary = {
         "teacher_rollouts": spec_rows,
@@ -659,8 +743,12 @@ def run_controlled_dataset(args: argparse.Namespace) -> None:
         "val_rollouts": [str(path) for path in generated["val"]],
         "extra_rollouts": [str(path) for path in generated["extra"]],
         "pod_model": str(pod),
+        "condition_pod_model": str(condition_pod) if condition_pod else None,
+        "conditioning_mode": args.conditioning_mode,
         "linear_model": str(linear_model),
-        "nn_model": str(nn_model),
+        "nn_model": str(scripted_nn_model) if scripted_nn_model else None,
+        "scripted_nn_model": str(scripted_nn_model) if scripted_nn_model else None,
+        "collider_nn_model": str(collider_nn_model) if collider_nn_model else None,
         "evaluations": eval_rows,
     }
     write_json(root / "controlled_dataset_summary.json", summary)
@@ -678,9 +766,12 @@ def write_controlled_dataset_report(path: Path, summary: dict[str, Any]) -> None
         f"- Validation rollouts: {len(summary['val_rollouts'])}",
         f"- Extrapolation rollouts: {len(summary['extra_rollouts'])}",
         f"- POD model: {summary['pod_model']}",
-        f"- NN model: {summary['nn_model']}",
+        f"- Conditioning mode: {summary.get('conditioning_mode', 'scripted-control')}",
+        f"- Collider condition POD: {summary.get('condition_pod_model') or 'not used'}",
+        f"- Scripted-control NN model: {summary.get('scripted_nn_model') or 'not run'}",
+        f"- Collider-conditioned NN model: {summary.get('collider_nn_model') or 'not run'}",
         "",
-        "The driven beam end uses combined twist, lateral translation, vertical translation, and axial in/out translation.",
+        "The driven beam end uses combined twist, lateral translation, vertical translation, and axial in/out translation. In collider-POD mode, the latent model is conditioned on POD coefficients of per-particle signed-distance, nearest-normal, and relative-velocity fields computed against sampled kinematic collider points.",
         "",
         "## Cases",
         "",
@@ -697,19 +788,27 @@ def write_controlled_dataset_report(path: Path, summary: dict[str, Any]) -> None
             "",
             "## Held-Out Metrics",
             "",
-            "| Split | Case | Model | Position RMSE (m) | Max Error (m) | Velocity Proxy RMSE (m/s) | Online FPS |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+            "| Split | Case | Model | Position RMSE (m) | Max Error (m) | Velocity Proxy RMSE (m/s) | Online FPS | Conditioning |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
         ]
     )
     for row in summary["evaluations"]:
         case = Path(row["rollout"]).name
-        for model_name, report_key in (("POD+NN", "nn_report"), ("POD+linear", "linear_report")):
+        report_specs = [
+            ("POD+linear", "linear_report"),
+            ("POD+NN scripted", "scripted_nn_report" if "scripted_nn_report" in row else "nn_report"),
+            ("POD+NN collider", "collider_nn_report"),
+        ]
+        for model_name, report_key in report_specs:
+            if report_key not in row:
+                continue
             report = row[report_key]
             q = report["quality"]
             t = report["timing"]
             lines.append(
                 f"| {row['split']} | {case} | {model_name} | {q['position_rmse_m']:.6g} | "
-                f"{q['position_max_l2_m']:.6g} | {q['velocity_proxy_rmse_m_per_s']:.6g} | {t['online_fps']:.2f} |"
+                f"{q['position_max_l2_m']:.6g} | {q['velocity_proxy_rmse_m_per_s']:.6g} | "
+                f"{t['online_fps']:.2f} | {report.get('conditioning_mode', 'scripted_control')} |"
             )
     path.write_text("\n".join(lines) + "\n")
 

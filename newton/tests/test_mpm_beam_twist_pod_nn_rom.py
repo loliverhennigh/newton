@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,8 +14,11 @@ from newton.examples.mpm.rom.beam_twist_pod_nn import (
     SCHEMA_VERSION,
     control_features,
     controlled_motion,
+    fit_collider_condition_pod,
     fit_pod,
     latent_feature_count,
+    load_rollout,
+    particle_collider_fields,
     project_to_pod,
     rollout_latent_linear,
     rollout_latent_nn,
@@ -124,6 +128,26 @@ class TestMpmBeamTwistPodNnRom(unittest.TestCase):
         np.testing.assert_allclose(translation, np.zeros(3), atol=1.0e-7)
         self.assertEqual(translation_vel.shape, (3,))
 
+    def test_load_rollout_reads_explicit_collider_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_dir = _write_synthetic_rollout(Path(tmp), "rollout", frames=2, twist_speed=1.0, vertical_amp=0.1)
+            collider_points = np.load(rollout_dir / "particle_q.npy")[:, [1, 3]]
+            collider_velocities = np.load(rollout_dir / "particle_qd.npy")[:, [1, 3]]
+            np.save(rollout_dir / "collider_points.npy", collider_points)
+            np.save(rollout_dir / "collider_velocities.npy", collider_velocities)
+            manifest = json.loads((rollout_dir / "manifest.json").read_text())
+            manifest["files"] = {
+                **manifest["files"],
+                "collider_points": "collider_points.npy",
+                "collider_velocities": "collider_velocities.npy",
+            }
+            write_json(rollout_dir / "manifest.json", manifest)
+
+            rollout = load_rollout(rollout_dir)
+
+            np.testing.assert_allclose(rollout["collider_points"], collider_points)
+            np.testing.assert_allclose(rollout["collider_velocities"], collider_velocities)
+
     def test_synthetic_pod_latent_pipeline_writes_finite_rollout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -132,12 +156,32 @@ class TestMpmBeamTwistPodNnRom(unittest.TestCase):
             val = _write_synthetic_rollout(root / "teacher", "val", frames=8, twist_speed=1.0, vertical_amp=0.10)
 
             pod_dir = fit_pod(root / "pod", [train0, train1], rank=3)
-            linear_dir = train_linear_latent(root / "models", [train0, train1], pod_dir)
-            nn_dir = train_mlp(root / "models", [train0, train1], pod_dir, hidden_dim=8, epochs=3, batch_size=4)
+            condition_dir = fit_collider_condition_pod(root / "condition", [train0, train1], rank=2)
+            linear_dir = train_linear_latent(root / "models", [train0, train1], pod_dir, condition_pod_dir=condition_dir)
+            nn_dir = train_mlp(
+                root / "models",
+                [train0, train1],
+                pod_dir,
+                hidden_dim=8,
+                epochs=3,
+                batch_size=4,
+                condition_pod_dir=condition_dir,
+            )
             linear_rollout = rollout_latent_linear(root / "reduced", val, pod_dir, linear_dir)
             nn_rollout = rollout_latent_nn(root / "reduced", val, pod_dir, nn_dir)
 
             self.assertEqual(latent_feature_count([train0]), 22)
+            self.assertEqual(latent_feature_count([train0], condition_pod_dir=condition_dir), 5)
+            fields = particle_collider_fields(
+                {
+                    "particle_q": np.load(val / "particle_q.npy"),
+                    "particle_qd": np.load(val / "particle_qd.npy"),
+                    "twist_indices": np.load(val / "twist_indices.npy"),
+                },
+                frames=2,
+            )
+            self.assertEqual(fields.shape, (2, 8, 7))
+            self.assertTrue(np.isfinite(fields).all())
             self.assertEqual(
                 control_features(
                     {
@@ -146,6 +190,25 @@ class TestMpmBeamTwistPodNnRom(unittest.TestCase):
                     }
                 ).shape[1],
                 7,
+            )
+            self.assertEqual(
+                control_features(
+                    {
+                        "time": np.array([0.0]),
+                        "particle_q": np.load(val / "particle_q.npy")[:1],
+                        "particle_qd": np.load(val / "particle_qd.npy")[:1],
+                        "twist_indices": np.load(val / "twist_indices.npy"),
+                        "manifest": {
+                            "config": {
+                                "young_modulus": 5.0e6,
+                                "damping": 0.001,
+                                "frame_dt": 1.0 / 240.0,
+                            }
+                        },
+                    },
+                    condition_pod_dir=condition_dir,
+                ).shape[1],
+                5,
             )
             for rollout_dir in (linear_rollout, nn_rollout):
                 pred_q = np.load(rollout_dir / "decoded_particle_q.npy")

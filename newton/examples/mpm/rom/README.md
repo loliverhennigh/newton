@@ -6,9 +6,22 @@ teacher, fits a POD decoder over particle positions, and trains a small neural
 network to advance the POD latent coordinates on held-out controlled beam
 rollouts.
 
-The reduced model is geometry-specific. It assumes the same beam particle layout
-and a small family of twist plus kinematic end-translation controls. It does not
-change the core MPM solver and does not use a sampled MPM residual solve.
+The reduced model is geometry-specific. It assumes the same beam particle layout,
+but it now evaluates three reduced methods:
+
+- `POD+linear`: ridge-regularized linear latent update using the original
+  low-dimensional scripted-control vector.
+- `POD+NN scripted`: neural latent update using the same scripted-control vector.
+- `POD+NN collider`: neural latent update using POD coefficients of per-particle
+  collider context fields:
+  signed distance to the nearest sampled collider point, nearest normal, and
+  relative collider velocity.
+
+The collider-POD path is intended as the more reusable interface. For the current
+beam demo, the sampled kinematic collider is the driven beam end. For a future
+tool/object contact case, the same interface can be filled from sampled rigid
+body or tool surface points. This still does not change the core MPM solver and
+does not use a sampled MPM residual solve.
 
 ## End-to-End Run
 
@@ -45,14 +58,18 @@ uv run python tools/mpm_beam_twist_pod_nn_rom.py run-controlled-dataset \
   --rank 16 \
   --epochs 1500 \
   --voxel-size 0.75 \
-  --hidden-dim 96
+  --hidden-dim 96 \
+  --conditioning-mode all \
+  --condition-rank 8
 ```
 
 This command generates 12 training rollouts, 4 interpolation validation rollouts,
 and 3 extrapolation rollouts. The right beam end is driven with combinations of
 twist, lateral motion, vertical motion, and axial in/out motion. It trains both a
-linear latent baseline and a neural latent model, then evaluates both on the
-held-out cases and writes `controlled_dataset_report.md`.
+linear latent baseline, a scripted-control neural latent model, and a
+collider-conditioned neural latent model, then evaluates them on the held-out
+cases and writes `controlled_dataset_report.md`. In `collider-pod` or `all` mode,
+it also writes the collider conditioning POD model under `condition_models/`.
 
 ## Individual Pipeline
 
@@ -78,18 +95,31 @@ uv run python tools/mpm_beam_twist_pod_nn_rom.py fit-pod \
   artifacts/beam_twist/teacher_rollouts/train_twist_1p1
 ```
 
+Fit collider-condition POD:
+
+```bash
+uv run python tools/mpm_beam_twist_pod_nn_rom.py fit-condition-pod \
+  --output-dir artifacts/beam_twist/condition_models \
+  --run-name collider_condition_pod_rank8 \
+  --rank 8 \
+  artifacts/beam_twist/teacher_rollouts/train_twist_0p9 \
+  artifacts/beam_twist/teacher_rollouts/train_twist_1p1
+```
+
 Train latent models:
 
 ```bash
 uv run python tools/mpm_beam_twist_pod_nn_rom.py train-linear \
   --output-dir artifacts/beam_twist/latent_models \
   --pod-dir artifacts/beam_twist/pod_models/pod_rank8 \
+  --condition-pod-dir artifacts/beam_twist/condition_models/collider_condition_pod_rank8 \
   artifacts/beam_twist/teacher_rollouts/train_twist_0p9 \
   artifacts/beam_twist/teacher_rollouts/train_twist_1p1
 
 uv run python tools/mpm_beam_twist_pod_nn_rom.py train-nn \
   --output-dir artifacts/beam_twist/latent_models \
   --pod-dir artifacts/beam_twist/pod_models/pod_rank8 \
+  --condition-pod-dir artifacts/beam_twist/condition_models/collider_condition_pod_rank8 \
   --epochs 1000 \
   artifacts/beam_twist/teacher_rollouts/train_twist_0p9 \
   artifacts/beam_twist/teacher_rollouts/train_twist_1p1
@@ -102,6 +132,7 @@ uv run python tools/mpm_beam_twist_pod_nn_rom.py rollout \
   --output-dir artifacts/beam_twist/reduced_rollouts \
   --pod-dir artifacts/beam_twist/pod_models/pod_rank8 \
   --model-dir artifacts/beam_twist/latent_models/pod_nn_latent \
+  --condition-pod-dir artifacts/beam_twist/condition_models/collider_condition_pod_rank8 \
   artifacts/beam_twist/teacher_rollouts/val_twist_1p0
 
 uv run python tools/mpm_beam_twist_pod_nn_rom.py render \
